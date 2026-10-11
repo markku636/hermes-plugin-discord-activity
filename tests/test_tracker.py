@@ -233,6 +233,19 @@ class HookLatencyTest(unittest.TestCase):
         finally:
             pkg._tracker = None
 
+    def test_server_icons_match_sanitized_server_names(self):
+        import os
+        from _load import pkg
+
+        os.environ["DISCORD_ACTIVITY_SERVER_ICONS"] = "my-search=🔍,github=🐙"
+        try:
+            icon_for = pkg._make_icon_for()
+            self.assertEqual(icon_for("mcp__my_search__query"), "🔍")
+            self.assertEqual(icon_for("mcp__github__list_issues"), "🐙")
+            self.assertEqual(icon_for("mcp__other__x"), "🔌")
+        finally:
+            del os.environ["DISCORD_ACTIVITY_SERVER_ICONS"]
+
     def test_non_discord_platform_is_ignored(self):
         from _load import pkg
 

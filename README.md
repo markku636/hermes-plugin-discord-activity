@@ -96,7 +96,7 @@ over a path the Hermes image `chown`s at start-up).
 | `DISCORD_ACTIVITY_MAX_LENGTH` | `1700` | 300–1900 |
 | `DISCORD_ACTIVITY_REPLY` | `true` | Post the card as a reply to the user's message |
 | `DISCORD_ACTIVITY_LOCALE` | `en` | `en` or `zh-TW` |
-| `DISCORD_ACTIVITY_SERVER_ICONS` | — | Icons per MCP server, e.g. `github=🐙,search=🔍` (default 🔌) |
+| `DISCORD_ACTIVITY_SERVER_ICONS` | — | Icons per MCP server (the `mcp_servers` key), e.g. `github=🐙,my-search=🔍` (default 🔌) |
 | `DISCORD_ACTIVITY_HIDE_TOOLS` | `clarify` | Comma-separated tool names not to show |
 | `DISCORD_ACTIVITY_API_BASE` | `https://discord.com/api/v10` | For tests |
 

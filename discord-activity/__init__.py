@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from collections import OrderedDict
 from typing import Any, Dict, Optional
@@ -77,8 +78,15 @@ def load_config() -> TrackerConfig:
 
 # ── icons ─────────────────────────────────────────────────────────────────────────────────────
 
+def _sanitize_server(name: str) -> str:
+    """Hermes registers MCP tools as ``mcp__<server>__<tool>`` with the server name sanitized the
+    same way (``my-server`` -> ``my_server``), so config keys are normalized to match."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
 def _make_icon_for() -> Any:
-    server_icons = _env_map("DISCORD_ACTIVITY_SERVER_ICONS")  # e.g. "github=🐙,search=🔍"
+    # e.g. "github=🐙,my-search=🔍"
+    server_icons = {_sanitize_server(k): v for k, v in _env_map("DISCORD_ACTIVITY_SERVER_ICONS").items()}
 
     def icon_for(tool_name: str) -> str:
         server = r.mcp_server_of(tool_name)

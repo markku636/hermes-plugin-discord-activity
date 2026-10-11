@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "DiscordBot (https://github.com/markku636/hermes-plugin-discord-activity, 0.1.0)"
+USER_AGENT = "DiscordBot (https://github.com/markku636/hermes-plugin-discord-activity, 0.1.1)"
 SUPPRESS_EMBEDS = 1 << 2
 
 

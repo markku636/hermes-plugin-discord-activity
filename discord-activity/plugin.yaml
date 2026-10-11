@@ -1,5 +1,5 @@
 name: discord-activity
-version: 0.1.0
+version: 0.1.1
 description: "Live tool and model status for Discord: one message per conversation, edited in place with each tool's status, duration, arguments and result."
 author: "markku636"
 requires_env:
