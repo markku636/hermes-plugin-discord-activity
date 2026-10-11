@@ -30,6 +30,25 @@ into one 🧠 row.
 After a successful turn the card is deleted (configurable); after a failure or `/stop` it stays as a
 breadcrumb.
 
+### Progress bars — only from real numbers
+
+```
+📋 plan ▕███░░░░░░░▏ 1/3  33%
+   └─ ▶ Generate the podcast intro
+
+🎙️ tts.podcast_status ▾ ✔ [310ms] ×3
+   ├─ job_id: 8f2c
+   └─ ▕████████░░▏ 30/40  75% · running
+```
+
+- **Whole task**: when the agent keeps a todo list (Hermes `todo_list`), a pinned 📋 row shows
+  completed / total (cancelled items are left out) and the item in progress. No todo list, no row.
+- **Long-running jobs**: when a tool result reports progress — `progress` as `"12/40"`, `0.45`, `45` or
+  `"45%"`; `percent` / `percentage` / `pct`; or `current|step|done|completed|processed` with `total` —
+  the row gets a bar. Repeated status polls of the same job (same tool and same `job_id` / `id` /
+  `task_id` …) are merged into one row that updates in place, marked `×N`.
+- Nothing is estimated from elapsed time: a tool that reports no numbers gets no bar.
+
 ## How it works
 
 It is a regular Hermes user plugin. Hooks used: `pre_llm_call`, `post_llm_call`,

@@ -46,6 +46,7 @@ LABELS: Dict[str, Dict[str, str]] = {
         "error": "error",
         "items": "{n} items",
         "running": "running",
+        "plan": "plan",
     },
     "zh-TW": {
         "more_chars": "(+{n} 字)",
@@ -57,6 +58,7 @@ LABELS: Dict[str, Dict[str, str]] = {
         "error": "error",
         "items": "{n} 筆",
         "running": "進行中",
+        "plan": "計畫",
     },
 }
 
@@ -89,11 +91,44 @@ class ToolEntry:
     result: Optional[str] = None
     error: Optional[str] = None
     level: int = EXPANDED  # only ever increases: expanded -> collapsed -> removed
+    progress: Optional["Progress"] = None  # only when the tool reported real numbers
+    job_key: Optional[str] = None          # same tool + same job id -> one row, updated in place
+    repeats: int = 1
 
     def elapsed_ms(self, now: float) -> float:
         if self.duration_ms is not None:
             return self.duration_ms
         return max(0.0, (now - self.started) * 1000.0)
+
+
+@dataclass
+class Progress:
+    """Real progress reported by a tool. ``done``/``total`` when known, else ``fraction`` only."""
+
+    fraction: float
+    done: Optional[float] = None
+    total: Optional[float] = None
+    status: Optional[str] = None
+
+
+@dataclass
+class PlanEntry:
+    """The agent's own todo list (Hermes ``todo_list``): the only honest whole-task progress."""
+
+    items: List[Tuple[str, str]] = field(default_factory=list)  # (content, status)
+
+    def counts(self) -> Tuple[int, int]:
+        live = [st for _, st in self.items if st != "cancelled"]
+        return sum(1 for st in live if st == "completed"), len(live)
+
+    def current(self) -> Optional[str]:
+        for content, st in self.items:
+            if st == "in_progress":
+                return content
+        for content, st in self.items:
+            if st == "pending":
+                return content
+        return None
 
 
 @dataclass
@@ -220,6 +255,124 @@ def summarize_result(result: Any, cfg: RenderConfig) -> Optional[str]:
     return _scalar(parsed)
 
 
+_PROGRESS_KEYS = ("progress", "percent", "percentage", "pct", "progress_percent", "progressPercent")
+_DONE_KEYS = ("current", "step", "done", "completed", "processed", "current_step", "currentStep")
+_TOTAL_KEYS = ("total", "total_steps", "totalSteps", "steps", "count")
+_STATUS_KEYS = ("status", "state", "phase", "stage")
+_FRACTION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*$")
+_PERCENT = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%\s*$")
+
+
+def _unwrap(result: Any) -> Any:
+    """JSON-decode a tool result and peel MCP / Hermes envelopes (same rules as summarize_result)."""
+    parsed: Any = result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            return None
+    for _ in range(3):
+        if isinstance(parsed, dict) and len(parsed) <= 3:
+            inner = parsed.get("result", parsed.get("content"))
+            if isinstance(inner, list) and inner and isinstance(inner[0], dict) and "text" in inner[0]:
+                inner = inner[0]["text"]
+            if isinstance(inner, str):
+                try:
+                    parsed = json.loads(inner)
+                    continue
+                except Exception:
+                    return parsed
+            if isinstance(inner, (dict, list)):
+                parsed = inner
+                continue
+        break
+    return parsed
+
+
+def _num(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _progress_from_value(value: Any, key: str) -> Optional[Progress]:
+    if isinstance(value, str):
+        m = _FRACTION.match(value)
+        if m:
+            done, total = float(m.group(1)), float(m.group(2))
+            return Progress(fraction=done / total, done=done, total=total) if total > 0 and done <= total else None
+        m = _PERCENT.match(value)
+        if m:
+            return Progress(fraction=float(m.group(1)) / 100.0)
+        return None
+    n = _num(value)
+    if n is None or n < 0:
+        return None
+    if key == "progress" and n <= 1.0:
+        return Progress(fraction=n)            # 0–1 fraction (0.45)
+    if n <= 100.0:
+        return Progress(fraction=n / 100.0)    # 0–100 percent (45)
+    return None
+
+
+def parse_progress(result: Any) -> Optional[Progress]:
+    """Progress a tool actually reported, or None. Never guesses: no numbers -> no bar."""
+    data = _unwrap(result)
+    candidates = [data]
+    if isinstance(data, dict):
+        candidates += [v for k, v in data.items() if k in ("job", "data", "task", "generation", "run") and isinstance(v, dict)]
+    for obj in candidates:
+        if not isinstance(obj, dict):
+            continue
+        status = next((str(obj[k]) for k in _STATUS_KEYS if isinstance(obj.get(k), str) and obj[k].strip()), None)
+        found: Optional[Progress] = None
+        for key in _PROGRESS_KEYS:
+            if key in obj:
+                found = _progress_from_value(obj[key], key)
+                if found:
+                    break
+        if found is None:
+            done = next((_num(obj[k]) for k in _DONE_KEYS if _num(obj.get(k)) is not None), None)
+            total = next((_num(obj[k]) for k in _TOTAL_KEYS if _num(obj.get(k)) is not None), None)
+            if done is not None and total and 0 <= done <= total:
+                found = Progress(fraction=done / total, done=done, total=total)
+        if found is not None:
+            found.fraction = max(0.0, min(1.0, found.fraction))
+            found.status = status
+            return found
+    return None
+
+
+def parse_todos(result: Any) -> Optional[PlanEntry]:
+    """Hermes ``todo_list`` result -> PlanEntry; None when it is not a todo payload."""
+    data = _unwrap(result)
+    todos = data.get("todos") if isinstance(data, dict) else None
+    if not isinstance(todos, list):
+        return None
+    items = []
+    for t in todos:
+        if isinstance(t, dict) and str(t.get("content") or "").strip():
+            items.append((str(t["content"]), str(t.get("status") or "pending").lower()))
+    return PlanEntry(items=items) if items else None
+
+
+def _fmt_num(n: Optional[float]) -> str:
+    if n is None:
+        return ""
+    return str(int(n)) if float(n).is_integer() else f"{n:g}"
+
+
+def progress_bar(p: Progress, width: int = 10) -> str:
+    """``▕██████░░░░▏ 3/5  60%`` — filled cells green, empty cells gray."""
+    filled = int(round(p.fraction * width))
+    filled = min(width, max(0, filled))
+    bar = f"{GRAY}▕{RESET}{GREEN}{'█' * filled}{RESET}{GRAY}{'░' * (width - filled)}▏{RESET}"
+    count = f" {WHITE}{_fmt_num(p.done)}/{_fmt_num(p.total)}{RESET}" if p.done is not None and p.total else ""
+    return f"{bar}{count}  {BOLD_ORANGE}{int(round(p.fraction * 100))}%{RESET}"
+
+
 # ── layout ────────────────────────────────────────────────────────────────────────────────────
 
 def _pack_args(args: List[Tuple[str, str]], cfg: RenderConfig) -> List[str]:
@@ -279,18 +432,36 @@ def _model_block(m: ModelEntry, now: float, cfg: RenderConfig) -> List[str]:
 
 def _tool_block(t: ToolEntry, now: float, cfg: RenderConfig) -> List[str]:
     children = _pack_args(t.args, cfg)
+    if t.progress is not None:
+        status = f" {GRAY}·{RESET} {WHITE}{clip(t.progress.status, 20, cfg)}{RESET}" if t.progress.status else ""
+        children.append(progress_bar(t.progress) + status)
     if t.error:
         children.append(f"{RED}{cfg.label('error')}{RESET}: {clip(t.error, cfg.field_width, cfg)}")
-    elif t.result:
+    elif t.result and t.progress is None:
         children.append(f"{PINK}{cfg.label('result')}{RESET}: {GREEN}{clip(t.result, cfg.field_width, cfg)}{RESET}")
     lines = [_header(t.icon, t.name, t.level, t.status, t.elapsed_ms(now), bool(children))]
+    if t.repeats > 1:
+        lines[0] += f" {GRAY}×{t.repeats}{RESET}"
     if t.level == EXPANDED:
         lines += _tree(children)
     return lines
 
 
-def _compose(model: Optional[ModelEntry], tools: List[ToolEntry], removed: int, now: float, cfg: RenderConfig) -> str:
+def _plan_block(plan: PlanEntry, cfg: RenderConfig) -> str:
+    done, total = plan.counts()
+    frac = done / total if total else 1.0
+    line = f"📋 {BOLD_CYAN}{cfg.label('plan')}{RESET} " + progress_bar(Progress(fraction=frac, done=done, total=total))
+    current = plan.current()
+    if current and done < total:
+        line += f"\n   {GRAY}└─{RESET} {YELLOW}▶{RESET} {clip(current, cfg.field_width, cfg)}"
+    return line
+
+
+def _compose(model: Optional[ModelEntry], tools: List[ToolEntry], removed: int, now: float, cfg: RenderConfig,
+             plan: Optional[PlanEntry] = None) -> str:
     blocks: List[str] = []
+    if plan is not None and plan.items:
+        blocks.append(_plan_block(plan, cfg))  # protected: never collapsed or removed
     if removed:
         blocks.append(f"{GRAY}{cfg.label('earlier', n=removed)}{RESET}")
     if model is not None and model.level != REMOVED:
@@ -301,14 +472,15 @@ def _compose(model: Optional[ModelEntry], tools: List[ToolEntry], removed: int, 
     return "```ansi\n" + "\n\n".join(blocks) + "\n```"
 
 
-def render(model: Optional[ModelEntry], tools: List[ToolEntry], now: float, cfg: RenderConfig) -> str:
+def render(model: Optional[ModelEntry], tools: List[ToolEntry], now: float, cfg: RenderConfig,
+           plan: Optional[PlanEntry] = None) -> str:
     """Lay out the card within ``max_rows`` outer rows and ``max_length`` characters.
 
     Mutates each entry's ``level`` — but only upwards (expanded -> collapsed -> removed), so a later
     render never shows something an earlier one already folded away.
     """
-    # 1. slot budget: the model row takes one slot; drop the oldest finished tools first
-    slots = cfg.max_rows - (1 if model is not None else 0)
+    # 1. slot budget: the plan and model rows take one slot each; drop the oldest finished tools first
+    slots = cfg.max_rows - (1 if model is not None else 0) - (1 if plan is not None and plan.items else 0)
     visible = [t for t in tools if t.level != REMOVED]
     for t in visible:
         if len([v for v in tools if v.level != REMOVED]) <= slots:
@@ -324,7 +496,7 @@ def render(model: Optional[ModelEntry], tools: List[ToolEntry], now: float, cfg:
     def removed_count() -> int:
         return sum(1 for t in tools if t.level == REMOVED)
 
-    text = _compose(model, tools, removed_count(), now, cfg)
+    text = _compose(model, tools, removed_count(), now, cfg, plan)
     # 2. length budget: collapse oldest finished, then oldest at all, then remove oldest finished
     candidates = [t for t in tools if t.level == EXPANDED and t.status != PENDING]
     candidates += [t for t in tools if t.level == EXPANDED and t.status == PENDING]
@@ -334,13 +506,13 @@ def render(model: Optional[ModelEntry], tools: List[ToolEntry], now: float, cfg:
         if len(text) <= cfg.max_length:
             break
         entry.level = COLLAPSED
-        text = _compose(model, tools, removed_count(), now, cfg)
+        text = _compose(model, tools, removed_count(), now, cfg, plan)
     for t in tools:
         if len(text) <= cfg.max_length:
             break
         if t.level != REMOVED and t.status != PENDING:
             t.level = REMOVED
-            text = _compose(model, tools, removed_count(), now, cfg)
+            text = _compose(model, tools, removed_count(), now, cfg, plan)
     if len(text) > cfg.max_length:  # last resort, should not happen with sane limits
         text = text[: cfg.max_length - 4].rstrip() + "\n```"
     return text

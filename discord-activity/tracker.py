@@ -46,6 +46,7 @@ class Run:
     started: float
     last_event: float
     model: Optional[r.ModelEntry] = None
+    plan: Optional[r.PlanEntry] = None
     tools: List[r.ToolEntry] = field(default_factory=list)
     message_id: Optional[str] = None
     last_content: str = ""
@@ -59,6 +60,21 @@ class Run:
         if any(t.status == r.ERROR for t in self.tools):
             return True
         return self.model is not None and self.model.status == r.ERROR
+
+
+PLAN_TOOLS = {"todo_list", "todo"}
+# Argument names that identify one long-running job across repeated status polls
+_JOB_KEYS = ("job_id", "jobId", "generation_id", "generationId", "task_id", "taskId", "run_id", "runId", "id")
+
+
+def job_key(name: str, args: Any) -> Optional[str]:
+    if not isinstance(args, dict):
+        return None
+    for key in _JOB_KEYS:
+        value = args.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return f"{name}|{key}={value}"
+    return None
 
 
 class Tracker:
@@ -216,12 +232,24 @@ class Tracker:
         run.dirty = True
         if run.model is not None and run.model.inflight_since is None and not run.model_error_open:
             run.model.status = r.OK
+        if r.normalize_tool_name(name) in PLAN_TOOLS:
+            return  # shown as the 📋 plan row instead of a tool row
+        key = job_key(r.normalize_tool_name(name), args)
+        if key:
+            # polling the same job again: reuse its row so the bar updates in place
+            for t in run.tools:
+                if t.job_key == key and t.status != r.PENDING and t.level != r.REMOVED:
+                    t.status, t.started, t.duration_ms, t.error = r.PENDING, now, None, None
+                    t.call_id = call_id or t.call_id
+                    t.repeats += 1
+                    return
         run.tools.append(r.ToolEntry(
             call_id=call_id or f"anon-{len(run.tools)}",
             name=r.normalize_tool_name(name),
             icon=self.icon_for(name),
             started=now,
             args=r.summarize_args(args),
+            job_key=key,
         ))
 
     def _on_tool_end(self, now: float, target: Target, session_id: str, call_id: str, name: str,
@@ -231,6 +259,11 @@ class Tracker:
             return
         run.last_event = now
         run.dirty = True
+        if r.normalize_tool_name(name) in PLAN_TOOLS:
+            plan = r.parse_todos(result)
+            if plan is not None:
+                run.plan = plan
+            return
         entry = self._match(run, call_id, r.normalize_tool_name(name))
         if entry is None:
             return
@@ -241,6 +274,9 @@ class Tracker:
         else:
             entry.status = r.OK
             entry.result = r.summarize_result(result, self.cfg.render)
+            progress = r.parse_progress(result)
+            if progress is not None:
+                entry.progress = progress
 
     @staticmethod
     def _match(run: Run, call_id: str, name: str) -> Optional[r.ToolEntry]:
@@ -258,7 +294,7 @@ class Tracker:
     def _should_show(self, run: Run, now: float) -> bool:
         if run.dead:
             return False
-        if run.message_id is not None or run.tools:
+        if run.message_id is not None or run.tools or (run.plan is not None and run.plan.items):
             return True
         return run.model is not None and now - run.started >= self.cfg.show_after_seconds
 
@@ -269,7 +305,7 @@ class Tracker:
         return run.model is not None and run.model.inflight_since is not None
 
     def _flush(self, run: Run, now: float) -> None:
-        content = r.render(run.model, run.tools, now, self.cfg.render)
+        content = r.render(run.model, run.tools, now, self.cfg.render, run.plan)
         run.last_flush = now
         run.dirty = False
         if content == run.last_content:
